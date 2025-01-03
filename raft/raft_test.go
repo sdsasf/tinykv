@@ -109,6 +109,7 @@ func TestLeaderCycle2AA(t *testing.T) {
 
 		for _, peer := range n.peers {
 			sm := peer.(*Raft)
+			//fmt.Printf("sm.id: %d, sm.State: %v, Term %d\n", sm.id, sm.State, sm.Term)
 			if sm.id == campaignerID && sm.State != StateLeader {
 				t.Errorf("campaigning node %d state = %v, want StateLeader",
 					sm.id, sm.State)
@@ -562,10 +563,10 @@ func TestProposal2AB(t *testing.T) {
 }
 
 // TestHandleMessageType_MsgAppend ensures:
-// 1. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm.
-// 2. If an existing entry conflicts with a new one (same index but different terms),
-//    delete the existing entry and all that follow it; append any new entries not already in the log.
-// 3. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry).
+//  1. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm.
+//  2. If an existing entry conflicts with a new one (same index but different terms),
+//     delete the existing entry and all that follow it; append any new entries not already in the log.
+//  3. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry).
 func TestHandleMessageType_MsgAppend2AB(t *testing.T) {
 	tests := []struct {
 		m       pb.Message

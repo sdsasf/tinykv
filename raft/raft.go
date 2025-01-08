@@ -32,6 +32,7 @@ const (
 	debugHeartBeat          = false
 	debugLogAppend          = false
 	debugMessage            = false
+	debugRaft               = false
 )
 
 // None is a placeholder node ID used when there is no leader.
@@ -205,6 +206,7 @@ type Raft struct {
 	// [electionTimeout, 2 * electionTimeout - 1]. It gets reset
 	// when raft changes its state to follower or candidate.
 	randomizedElectionTimeout int
+	// use state machine function can't pass test :(
 	//step                      stepFunc
 }
 
@@ -225,7 +227,7 @@ func newRaft(c *Config) *Raft {
 	for _, peer := range c.peers {
 		prs[peer] = &Progress{
 			Match: 0,
-			Next:  0,
+			Next:  1,
 		}
 	}
 	// if use memory storage, have a dummy entry at term 0, index 0
@@ -248,6 +250,9 @@ func newRaft(c *Config) *Raft {
 		PendingConfIndex: 0,
 	}
 	r.becomeFollower(r.Term, None)
+	if debugRaft {
+		fmt.Printf("%x start a new raft peer, Term:%d, log:%v\n", r.id, r.Term, r.RaftLog)
+	}
 	return r
 }
 
@@ -260,31 +265,42 @@ func (r *Raft) sendAppend(to uint64) bool {
 		To:      to,
 		From:    r.id,
 		Term:    r.Term,
-		Reject:  false,
 	}
 	progress := r.Prs[to]
+	// TODO remove printf
+	//fmt.Printf("send append to %d, next is %d\n", to, progress.Next)
 	term, _ := r.RaftLog.Term(progress.Next - 1)
 	ents, _ := r.RaftLog.EntriesAfter(progress.Next)
 	// if there are no new entries, don't send append message
-	if len(ents) == 0 {
-		return false
-	}
+	//if len(ents) == 0 {
+	//	return false
+	//}
 	m.LogTerm = term
 	m.Index = progress.Next - 1
 	m.Entries = ents
 	m.Commit = r.RaftLog.committed
 
 	r.send(m)
+	if debugLogAppend {
+		fmt.Printf("%v %x send %d append entry to %x at term %d, commitIndex %v\n", r.State, r.id, len(m.Entries), to, r.Term, m.Commit)
+		if len(m.Entries) > 0 {
+			printEntries(m.Entries)
+		}
+	}
 	return true
 }
 
 func (r *Raft) bcastAppend() {
+	if debugLogAppend {
+		fmt.Printf("%x bcast append entry at term %d\n", r.id, r.Term)
+	}
+	if len(r.Prs) == 1 {
+		r.RaftLog.commitTo(r.RaftLog.LastIndex())
+		return
+	}
 	for peer := range r.Prs {
 		if peer != r.id {
 			r.sendAppend(peer)
-			if debugLogAppend {
-				fmt.Printf("%x send append entry to %x at term %d\n", r.id, peer, r.Term)
-			}
 		}
 	}
 }
@@ -417,6 +433,9 @@ func (r *Raft) becomeLeader() {
 	if r.State == StateFollower {
 		panic("invalid transition [follower -> leader]")
 	}
+	if debugStateTransfer {
+		fmt.Printf("%x became leader in term %d\n", r.id, r.Term)
+	}
 	r.reset(r.Term)
 	//r.step = stepLeader
 	r.State = StateLeader
@@ -436,21 +455,17 @@ func (r *Raft) becomeLeader() {
 		Data:  nil,
 	}
 	lastIndex = r.RaftLog.Append(emptyEnt)
+	if debugLogAppend {
+		fmt.Printf("%x append empty entry at term %d, index %d ", r.id, r.Term, lastIndex)
+		printEntries(append(make([]*pb.Entry, 0), emptyEnt))
+	}
 	// update leader's progress
 	r.Prs[r.id] = &Progress{
 		Match: lastIndex,
 		Next:  lastIndex + 1,
 	}
-	for peer := range r.Prs {
-		if peer != r.id {
-			r.sendAppend(peer)
-		}
-	}
-	if debugStateTransfer {
-		fmt.Printf("%x became leader in term %d\n", r.id, r.Term)
-	}
 
-	// update commit index
+	r.bcastAppend()
 }
 
 // Step the entrance of handle message, see `MessageType`
@@ -535,15 +550,43 @@ func stepLeader(r *Raft, m pb.Message) error {
 	//fmt.Printf("%d enter stepLeader\n", r.id)
 	switch m.MsgType {
 	case pb.MessageType_MsgAppendResponse:
+		if m.Reject {
+			if debugLogAppend {
+				fmt.Printf("%x received MsgAppResp(rejected, hint: (index %d, term %d)) from %x",
+					r.id, m.Index, m.LogTerm, m.From)
+			}
+			r.Prs[m.From].Next = m.Index + 1
+			r.sendAppend(m.From)
+		} else {
+			if m.Index > r.Prs[m.From].Match {
+				//if debugLogAppend {
+				//	fmt.Printf("%x received MsgAppResp(accepted, index %d) from %x",
+				//		r.id, m.Index, m.From)
+				//}
+				r.Prs[m.From].Match = m.Index
+				r.Prs[m.From].Next = max(m.Index+1, r.Prs[m.From].Next)
+				if debugLogAppend {
+					fmt.Printf("%x update %x match index to %d, next to %d\n", r.id, m.From, r.Prs[m.From].Match, r.Prs[m.From].Next)
+				}
+				if r.maybeCommit() {
+					r.bcastAppend()
+				}
+			}
+		}
 	case pb.MessageType_MsgBeat:
 		//fmt.Printf("%d enter bcastheartbeat\n", r.id)
 		r.bcastHeartbeat()
 	case pb.MessageType_MsgHeartbeatResponse:
+		// send log to follower when it received a heartbeat response
+		// which indicate it doesn't have update-to-date log
+		if m.Commit < r.RaftLog.committed {
+			r.sendAppend(m.From)
+		}
 	case pb.MessageType_MsgPropose:
 		if len(m.Entries) == 0 {
 			panic(fmt.Sprintf("%x stepped empty MsgProp", r.id))
 		}
-		r.RaftLog.Append(m.Entries...)
+		r.appendEntry(m.Entries...)
 		r.bcastAppend()
 	}
 	return nil
@@ -600,19 +643,36 @@ func stepFollower(r *Raft, m pb.Message) error {
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
 	// shouldn't modify committed entries
-	if m.Index < r.RaftLog.committed {
-		r.send(pb.Message{
-			MsgType: pb.MessageType_MsgAppendResponse,
-			To:      m.From,
-			From:    r.id,
-			Term:    r.Term,
-			Commit:  r.RaftLog.committed,
-			Reject:  false,
-		})
-		return
-	}
+	//if m.Index < r.RaftLog.committed {
+	//	if len(m.Entries) == 0 && r.RaftLog.matchTerm(m.Index, m.LogTerm) {
+	//		r.send(pb.Message{
+	//			MsgType: pb.MessageType_MsgAppendResponse,
+	//			To:      m.From,
+	//			From:    r.id,
+	//			Term:    r.Term,
+	//			// last append entry index
+	//			Index:  r.RaftLog.committed,
+	//			Reject: false,
+	//		})
+	//	} else {
+	//		r.send(pb.Message{
+	//			MsgType: pb.MessageType_MsgAppendResponse,
+	//			To:      m.From,
+	//			From:    r.id,
+	//			Term:    r.Term,
+	//			// last append entry index
+	//			Index:  r.RaftLog.committed,
+	//			Reject: true,
+	//		})
+	//	}
+	//	return
+	//}
 
 	if lastNewIndex, ok := r.RaftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, m.Entries...); ok {
+		// if append success, message.Index is lastNewIndex
+
+		// TODO remove printf
+		//fmt.Printf("%d response append entry, lastNewIndex is %d\n", r.id, lastNewIndex)
 		r.send(pb.Message{
 			MsgType: pb.MessageType_MsgAppendResponse,
 			To:      m.From,
@@ -621,9 +681,21 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			Index:   lastNewIndex,
 			Reject:  false,
 		})
+		if debugLogAppend {
+			fmt.Printf("%v %x append %d entry at term %d\n", r.State, r.id, len(m.Entries), r.Term)
+			if len(m.Entries) > 0 {
+				printEntries(m.Entries)
+			}
+		}
 	} else {
-		//hintIndex := min(m.Index, r.RaftLog.LastIndex())
-		hintIndex := m.Index - 1
+		// if append fail, message.Index is next index that should check term and index
+		if debugLogAppend {
+			fmt.Printf("%v %x reject append entries because index and term is mismatch\n", r.State, r.id)
+		}
+		hintIndex := min(m.Index-1, r.RaftLog.LastIndex())
+		// TODO remove printf
+		//fmt.Printf("%d reject append entry, hintIndex is %d\n", r.id, hintIndex)
+		// impossible occur error
 		hintTerm, _ := r.RaftLog.Term(hintIndex)
 		r.send(pb.Message{
 			MsgType: pb.MessageType_MsgAppendResponse,
@@ -640,15 +712,12 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
-	r.RaftLog.commitTo(m.Commit)
 	r.send(pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeatResponse,
 		To:      m.From,
 		From:    r.id,
 		Term:    r.Term,
-		Entries: nil,
 		Commit:  r.RaftLog.committed,
-		Reject:  false,
 	})
 }
 
@@ -773,4 +842,72 @@ func (r *Raft) TallyVotes() (granted int, rejected int, result VoteResult) {
 		result = VotePending
 	}
 	return granted, rejected, result
+}
+
+// used by Leader to try to advance the commit index
+func (r *Raft) maybeCommit() bool {
+	cmi := r.committedIndex()
+	term, err := r.RaftLog.Term(cmi)
+	if err != nil {
+		panic("shouldn't happen this")
+	}
+	// omly commit log when term is the same as current term
+	if cmi > r.RaftLog.committed && term == r.Term {
+		r.RaftLog.commitTo(cmi)
+		return true
+	}
+	return false
+}
+
+// committedIndex computes the possible start committed index through raft.Prs
+func (r *Raft) committedIndex() uint64 {
+	var stack [7]uint64
+	var srt []uint64
+	n := len(r.Prs)
+	// if peers number is less than 7, use stack to avoid memory allocation
+	if n >= 7 {
+		srt = make([]uint64, n)
+	} else {
+		srt = stack[:n]
+	}
+	i := n - 1
+	for _, progress := range r.Prs {
+		srt[i] = progress.Match
+		i--
+	}
+	// use my insertionSort to keep srt on the stack
+	insertionSort(srt)
+	pos := n - (n/2 + 1)
+	return srt[pos]
+}
+
+func insertionSort(sl []uint64) {
+	a, b := 0, len(sl)
+	for i := a + 1; i < b; i++ {
+		for j := i; j > a && sl[j] < sl[j-1]; j-- {
+			sl[j], sl[j-1] = sl[j-1], sl[j]
+		}
+	}
+}
+
+func (r *Raft) appendEntry(es ...*pb.Entry) (accepted bool) {
+	li := r.RaftLog.LastIndex()
+	for i := range es {
+		es[i].Term = r.Term
+		es[i].Index = li + 1 + uint64(i)
+	}
+	r.RaftLog.Append(es...)
+	// update leader's progress
+	r.Prs[r.id].Match = max(r.RaftLog.LastIndex(), r.Prs[r.id].Match)
+	r.Prs[r.id].Next = max(r.RaftLog.LastIndex()+1, r.Prs[r.id].Next)
+	return true
+}
+
+// for debug log print
+func printEntries(ents []*pb.Entry) {
+	fmt.Printf("log entries: [")
+	for _, ent := range ents {
+		fmt.Printf("[Index:%v, Term:%v, data:%v], ", ent.Term, ent.Index, ent.Data)
+	}
+	fmt.Printf("]\n")
 }

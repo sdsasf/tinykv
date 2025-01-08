@@ -122,7 +122,15 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
-	return nil
+	if len(l.entries) > 0 {
+		firstIndex := l.FirstIndex()
+		committedIndex := l.committed
+		appliedIndex := l.applied
+		if committedIndex >= firstIndex && appliedIndex < committedIndex {
+			return l.entries[appliedIndex-firstIndex+1 : committedIndex-firstIndex+1]
+		}
+	}
+	return make([]pb.Entry, 0)
 }
 
 // LastIndex return the last index of the log entries
@@ -176,26 +184,25 @@ func (l *RaftLog) Append(entries ...*pb.Entry) uint64 {
 	return l.LastIndex()
 }
 
-func (l *RaftLog) truncateAndAppend(entries []pb.Entry) {
-	after := entries[0].Index
+func (l *RaftLog) truncateAndAppend(ents []pb.Entry) {
+	after := ents[0].Index
 	switch {
-	case after == l.stabled+uint64(len(l.entries))+1:
-		l.entries = append(l.entries, entries...)
+	case after == l.LastIndex()+1:
+		l.entries = append(l.entries, ents...)
+		//if debugLogAppend {
+		//	fmt.Printf("append %d entries at index %d\n", len(ents), after)
+		//}
+	case after <= l.FirstIndex():
 		if debugLogAppend {
-			fmt.Printf("append %d entries at index %d\n", len(entries), after)
+			fmt.Printf("replace the entries from index %d\n", after)
 		}
-	case after <= l.stabled:
-		if debugLogAppend {
-			fmt.Printf("replace the unstable entries from index %d\n", after)
-		}
-		l.stabled = after - 1
-		l.entries = entries
+		l.entries = ents
 	default:
 		if debugLogAppend {
 			fmt.Printf("truncate the unstable entries before index %d\n", after)
 		}
-		l.entries = append([]pb.Entry{}, l.slice(l.stabled+1, after)...)
-		l.entries = append(l.entries, entries...)
+		l.entries = append([]pb.Entry{}, l.slice(l.FirstIndex(), after)...)
+		l.entries = append(l.entries, ents...)
 	}
 }
 
@@ -209,19 +216,17 @@ func (l *RaftLog) EntriesAfter(i uint64) ([]*pb.Entry, error) {
 }
 
 func (l *RaftLog) slice(lo, hi uint64) []pb.Entry {
-	l.mustCheckOutOfBounds(lo, hi)
+	l.checkOutOfBounds(lo, hi)
 	off := l.entries[0].Index
 	return l.entries[lo-off : hi-off]
 }
 
-// u.offset <= lo <= hi <= u.offset+len(u.entries)
-func (l *RaftLog) mustCheckOutOfBounds(lo, hi uint64) {
+func (l *RaftLog) checkOutOfBounds(lo, hi uint64) {
 	if lo > hi {
 		log.Panic(fmt.Sprintf("invalid unstable.slice %d > %d", lo, hi))
 	}
-	upper := l.stabled + uint64(len(l.entries)) + 1
-	if lo <= l.stabled || hi > upper {
-		log.Panic(fmt.Sprintf("unstable.slice[%d,%d) out of bound [%d,%d]", lo, hi, l.stabled+1, upper))
+	if lo < l.FirstIndex() || hi > l.LastIndex()+1 {
+		log.Panic(fmt.Sprintf("lice[%d,%d) out of bound [%d,%d]", lo, hi, l.FirstIndex(), l.LastIndex()))
 	}
 }
 
@@ -237,14 +242,16 @@ func (l *RaftLog) isUpToDate(lasti, term uint64) bool {
 	return term > lastTerm || (term == lastTerm && lasti >= lastIndex)
 }
 
-func (l *RaftLog) commitTo(tocommit uint64) {
+func (l *RaftLog) commitTo(tocommit uint64) bool {
 	// never decrease commit
 	if l.committed < tocommit {
 		if l.LastIndex() < tocommit {
 			log.Panic(fmt.Sprintf("tocommit(%d) is out of range [lastIndex(%d)]. Was the raft log corrupted, truncated, or lost?", tocommit, l.LastIndex()))
 		}
 		l.committed = tocommit
+		return true
 	}
+	return false
 }
 
 func convertPointerToEntry(entries []*pb.Entry) []pb.Entry {
@@ -271,19 +278,26 @@ func (l *RaftLog) LastTerm() uint64 {
 	return t
 }
 
-func (l *RaftLog) maybeAppend(index, logTerm, committed uint64, ents ...*pb.Entry) (lastnewi uint64, ok bool) {
-	if l.matchTerm(index, logTerm) {
-		lastnewi = index + uint64(len(ents))
+func (l *RaftLog) maybeAppend(preLogIndex, logTerm, committed uint64, ents ...*pb.Entry) (lastnewi uint64, ok bool) {
+	if l.matchTerm(preLogIndex, logTerm) {
+		lastnewi = preLogIndex + uint64(len(ents))
 		ci := l.findConflict(ents)
 		switch {
 		case ci == 0:
 		case ci <= l.committed:
 			log.Panic(fmt.Sprintf("entry %d conflict with committed entry [committed(%d)]", ci, l.committed))
 		default:
-			offset := index + 1
+			offset := preLogIndex + 1
 			l.Append(ents[ci-offset:]...)
+			if ci <= l.stabled {
+				l.stabled = ci - 1
+				// TODO should update storage ??
+			}
 		}
-		l.commitTo(min(committed, lastnewi))
+		isUpdateCommit := l.commitTo(min(committed, lastnewi))
+		if debugLogAppend && isUpdateCommit {
+			fmt.Printf("update commit index to %d\n", l.committed)
+		}
 		return lastnewi, true
 	}
 	return 0, false

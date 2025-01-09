@@ -133,6 +133,11 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	return make([]pb.Entry, 0)
 }
 
+func (l *RaftLog) hasNextEnts() bool {
+	off := max(l.applied+1, l.FirstIndex())
+	return l.committed+1 > off
+}
+
 // LastIndex return the last index of the log entries
 // if the log is empty, return last index of the storage
 func (l *RaftLog) LastIndex() uint64 {

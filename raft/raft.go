@@ -654,19 +654,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	//			Index:  r.RaftLog.committed,
 	//			Reject: false,
 	//		})
-	//	} else {
-	//		r.send(pb.Message{
-	//			MsgType: pb.MessageType_MsgAppendResponse,
-	//			To:      m.From,
-	//			From:    r.id,
-	//			Term:    r.Term,
-	//			// last append entry index
-	//			Index:  r.RaftLog.committed,
-	//			Reject: true,
-	//		})
 	//	}
-	//	return
-	//}
 
 	if lastNewIndex, ok := r.RaftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, m.Entries...); ok {
 		// if append success, message.Index is lastNewIndex
@@ -881,15 +869,6 @@ func (r *Raft) committedIndex() uint64 {
 	return srt[pos]
 }
 
-func insertionSort(sl []uint64) {
-	a, b := 0, len(sl)
-	for i := a + 1; i < b; i++ {
-		for j := i; j > a && sl[j] < sl[j-1]; j-- {
-			sl[j], sl[j-1] = sl[j-1], sl[j]
-		}
-	}
-}
-
 func (r *Raft) appendEntry(es ...*pb.Entry) (accepted bool) {
 	li := r.RaftLog.LastIndex()
 	for i := range es {
@@ -901,6 +880,30 @@ func (r *Raft) appendEntry(es ...*pb.Entry) (accepted bool) {
 	r.Prs[r.id].Match = max(r.RaftLog.LastIndex(), r.Prs[r.id].Match)
 	r.Prs[r.id].Next = max(r.RaftLog.LastIndex()+1, r.Prs[r.id].Next)
 	return true
+}
+
+func (r *Raft) softState() *SoftState {
+	return &SoftState{
+		Lead:      r.Lead,
+		RaftState: r.State,
+	}
+}
+
+func (r *Raft) hardState() pb.HardState {
+	return pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
+	}
+}
+
+func insertionSort(sl []uint64) {
+	a, b := 0, len(sl)
+	for i := a + 1; i < b; i++ {
+		for j := i; j > a && sl[j] < sl[j-1]; j-- {
+			sl[j], sl[j-1] = sl[j-1], sl[j]
+		}
+	}
 }
 
 // for debug log print

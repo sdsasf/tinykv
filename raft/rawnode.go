@@ -33,6 +33,10 @@ type SoftState struct {
 	RaftState StateType
 }
 
+func (a *SoftState) equal(b *SoftState) bool {
+	return a.Lead == b.Lead && a.RaftState == b.RaftState
+}
+
 // Ready encapsulates the entries and messages that are ready to read,
 // be saved to stable storage, committed or sent to other peers.
 // All fields in Ready are read-only.
@@ -66,16 +70,38 @@ type Ready struct {
 	Messages []pb.Message
 }
 
+func newReady(r *Raft, prevSoftSt *SoftState, prevHardSt pb.HardState) Ready {
+	rd := Ready{
+		Entries:          r.RaftLog.unstableEntries(),
+		CommittedEntries: r.RaftLog.nextEnts(),
+		Messages:         r.msgs,
+	}
+	if softSt := r.softState(); !softSt.equal(prevSoftSt) {
+		rd.SoftState = softSt
+	}
+	if hardSt := r.hardState(); !isHardStateEqual(hardSt, prevHardSt) {
+		rd.HardState = hardSt
+	}
+	// TODO snapshot ready
+	return rd
+}
+
 // RawNode is a wrapper of Raft.
 type RawNode struct {
 	Raft *Raft
 	// Your Data Here (2A).
+	prevSoftState *SoftState
+	prevHardState pb.HardState
 }
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
 func NewRawNode(config *Config) (*RawNode, error) {
 	// Your Code Here (2A).
-	return nil, nil
+	r := newRaft(config)
+	rn := &RawNode{Raft: r}
+	rn.prevSoftState = r.softState()
+	rn.prevHardState = r.hardState()
+	return rn, nil
 }
 
 // Tick advances the internal logical clock by a single tick.
@@ -143,12 +169,42 @@ func (rn *RawNode) Step(m pb.Message) error {
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
 	// Your Code Here (2A).
-	return Ready{}
+	rd := rn.readyWithoutAccept()
+	rn.acceptReady(rd)
+	return rd
+}
+
+// readyWithoutAccept returns a Ready.
+// This is a read-only operation, rawNode and raft state is not modified
+func (rn *RawNode) readyWithoutAccept() Ready {
+	return newReady(rn.Raft, rn.prevSoftState, rn.prevHardState)
+}
+
+// acceptReady is called when the consumer of the RawNode has decided to go ahead and handle a Ready
+// modify rawNode and raft state, but not rawNode.prevHardState
+func (rn *RawNode) acceptReady(rd Ready) {
+	if rd.SoftState != nil {
+		rn.prevSoftState = rd.SoftState
+	}
+	// fetch all messages in raft
+	rn.Raft.msgs = nil
+
 }
 
 // HasReady called when RawNode user need to check if any Ready pending.
 func (rn *RawNode) HasReady() bool {
 	// Your Code Here (2A).
+	r := rn.Raft
+	if !r.softState().equal(rn.prevSoftState) {
+		return true
+	}
+	if hardSt := r.hardState(); !IsEmptyHardState(hardSt) && !isHardStateEqual(hardSt, rn.prevHardState) {
+		return true
+	}
+	// TODO has pending snapshot ?
+	if len(r.msgs) != 0 || len(r.RaftLog.unstableEntries()) != 0 || r.RaftLog.hasNextEnts() {
+		return true
+	}
 	return false
 }
 
@@ -156,6 +212,16 @@ func (rn *RawNode) HasReady() bool {
 // last Ready results.
 func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
+	if !IsEmptyHardState(rd.HardState) {
+		rn.prevHardState = rd.HardState
+	}
+	if len(rd.Entries) != 0 {
+		rn.Raft.RaftLog.stabled = rd.Entries[len(rd.Entries)-1].Index
+	}
+	if len(rd.CommittedEntries) != 0 {
+		rn.Raft.RaftLog.applied = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
+	}
+	// TODO handle snapshot
 }
 
 // GetProgress return the Progress of this node and its peers, if this

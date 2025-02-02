@@ -31,6 +31,7 @@ const (
 	debugStateTransfer      = false
 	debugHeartBeat          = false
 	debugLogAppend          = false
+	debugPrintEntries       = false
 	debugMessage            = false
 	debugRaft               = false
 )
@@ -224,13 +225,15 @@ func newRaft(c *Config) *Raft {
 		c.peers = confState.Nodes
 	}
 	prs := make(map[uint64]*Progress)
+	nextIndex, _ := c.Storage.LastIndex()
 	for _, peer := range c.peers {
 		prs[peer] = &Progress{
 			Match: 0,
-			Next:  1,
+			// incase log index not start from 1
+			Next: nextIndex + 1,
 		}
 	}
-	// if use memory storage, have a dummy entry at term 0, index 0
+	// use peerStorage to create raftLog
 	raftLog := newLog(c.Storage)
 	r := &Raft{
 		id:               c.ID,
@@ -269,7 +272,10 @@ func (r *Raft) sendAppend(to uint64) bool {
 	progress := r.Prs[to]
 	// TODO remove printf
 	//fmt.Printf("send append to %d, next is %d\n", to, progress.Next)
-	term, _ := r.RaftLog.Term(progress.Next - 1)
+	term, err := r.RaftLog.Term(progress.Next - 1)
+	if err != nil {
+		log.Panic(fmt.Sprintf("error: %v, progress.Next - 1: %d\n", err.Error(), progress.Next-1))
+	}
 	ents, _ := r.RaftLog.EntriesAfter(progress.Next)
 	// if there are no new entries, don't send append message
 	//if len(ents) == 0 {
@@ -282,8 +288,9 @@ func (r *Raft) sendAppend(to uint64) bool {
 
 	r.send(m)
 	if debugLogAppend {
-		fmt.Printf("%v %x send %d append entry to %x at term %d, commitIndex %v\n", r.State, r.id, len(m.Entries), to, r.Term, m.Commit)
-		if len(m.Entries) > 0 {
+		fmt.Printf("%v %x send %d append entry to %x at term %d, commitIndex %v, prevIndex %d, prevLogTerm %d\n",
+			r.State, r.id, len(m.Entries), to, r.Term, m.Commit, m.Index, m.LogTerm)
+		if debugPrintEntries && len(m.Entries) > 0 {
 			printEntries(m.Entries)
 		}
 	}
@@ -457,7 +464,9 @@ func (r *Raft) becomeLeader() {
 	lastIndex = r.RaftLog.Append(emptyEnt)
 	if debugLogAppend {
 		fmt.Printf("%x append empty entry at term %d, index %d ", r.id, r.Term, lastIndex)
-		printEntries(append(make([]*pb.Entry, 0), emptyEnt))
+		if debugPrintEntries {
+			printEntries(append(make([]*pb.Entry, 0), emptyEnt))
+		}
 	}
 	// update leader's progress
 	r.Prs[r.id] = &Progress{
@@ -496,6 +505,8 @@ func (r *Raft) Step(m pb.Message) error {
 				From:    r.id,
 				Term:    r.Term,
 				Reject:  true,
+				Index:   r.RaftLog.LastIndex(),
+				LogTerm: r.RaftLog.LastTerm(),
 			})
 		}
 		return nil
@@ -552,8 +563,8 @@ func stepLeader(r *Raft, m pb.Message) error {
 	case pb.MessageType_MsgAppendResponse:
 		if m.Reject {
 			if debugLogAppend {
-				fmt.Printf("%x received MsgAppResp(rejected, hint: (index %d, term %d)) from %x",
-					r.id, m.Index, m.LogTerm, m.From)
+				fmt.Printf("%x received MsgAppResp(rejected, hint: (index %d, term %d)) from %x at term %d\n",
+					r.id, m.Index, m.LogTerm, m.From, r.Term)
 			}
 			r.Prs[m.From].Next = m.Index + 1
 			r.sendAppend(m.From)
@@ -670,16 +681,13 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			Reject:  false,
 		})
 		if debugLogAppend {
-			fmt.Printf("%v %x append %d entry at term %d\n", r.State, r.id, len(m.Entries), r.Term)
-			if len(m.Entries) > 0 {
+			fmt.Printf("%v %x append %d entry at term %d, lastIndex %d\n",
+				r.State, r.id, len(m.Entries), r.Term, lastNewIndex)
+			if debugPrintEntries && len(m.Entries) > 0 {
 				printEntries(m.Entries)
 			}
 		}
 	} else {
-		// if append fail, message.Index is next index that should check term and index
-		if debugLogAppend {
-			fmt.Printf("%v %x reject append entries because index and term is mismatch\n", r.State, r.id)
-		}
 		hintIndex := min(m.Index-1, r.RaftLog.LastIndex())
 		// TODO remove printf
 		//fmt.Printf("%d reject append entry, hintIndex is %d\n", r.id, hintIndex)
@@ -694,6 +702,11 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			LogTerm: hintTerm,
 			Reject:  true,
 		})
+		// if append fail, message.Index is next index that should check term and index
+		if debugLogAppend {
+			fmt.Printf("%v %x reject append entries m.Index-1 %d, r.RaftLog.LastIndex %d, LogTerm %d\n",
+				r.State, r.id, m.Index-1, r.RaftLog.LastIndex(), hintTerm)
+		}
 	}
 }
 
@@ -835,14 +848,18 @@ func (r *Raft) TallyVotes() (granted int, rejected int, result VoteResult) {
 // used by Leader to try to advance the commit index
 func (r *Raft) maybeCommit() bool {
 	cmi := r.committedIndex()
-	term, err := r.RaftLog.Term(cmi)
-	if err != nil {
-		panic("shouldn't happen this")
-	}
-	// omly commit log when term is the same as current term
-	if cmi > r.RaftLog.committed && term == r.Term {
-		r.RaftLog.commitTo(cmi)
-		return true
+	if cmi <= r.RaftLog.committed {
+		return false
+	} else {
+		term, err := r.RaftLog.Term(cmi)
+		if err != nil {
+			panic("shouldn't happen this")
+		}
+		// omly commit log when term is the same as current term
+		if term == r.Term {
+			r.RaftLog.commitTo(cmi)
+			return true
+		}
 	}
 	return false
 }

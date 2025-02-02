@@ -4,7 +4,7 @@ package raft_serverpb;
 import "eraftpb.proto";
 import "metapb.proto";
 
-// The message sent between Raft peer, it wraps the raft meessage with some meta information.
+// The message sent between Raft peer, it wraps the raft message with some meta information.
 message RaftMessage {
     uint64 region_id = 1;
     metapb.Peer from_peer = 2;

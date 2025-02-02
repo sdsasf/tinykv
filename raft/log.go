@@ -192,6 +192,8 @@ func (l *RaftLog) Append(entries ...*pb.Entry) uint64 {
 func (l *RaftLog) truncateAndAppend(ents []pb.Entry) {
 	after := ents[0].Index
 	switch {
+	case after > l.LastIndex()+1:
+		log.Panic(fmt.Sprintf("missing log entry [last: %d, append at: %d]", l.LastIndex(), ents[0].Index))
 	case after == l.LastIndex()+1:
 		l.entries = append(l.entries, ents...)
 		//if debugLogAppend {
@@ -201,6 +203,7 @@ func (l *RaftLog) truncateAndAppend(ents []pb.Entry) {
 		if debugLogAppend {
 			fmt.Printf("replace the entries from index %d\n", after)
 		}
+		// TODO need truncate entry ??
 		l.entries = ents
 	default:
 		if debugLogAppend {
@@ -231,7 +234,7 @@ func (l *RaftLog) checkOutOfBounds(lo, hi uint64) {
 		log.Panic(fmt.Sprintf("invalid unstable.slice %d > %d", lo, hi))
 	}
 	if lo < l.FirstIndex() || hi > l.LastIndex()+1 {
-		log.Panic(fmt.Sprintf("lice[%d,%d) out of bound [%d,%d]", lo, hi, l.FirstIndex(), l.LastIndex()))
+		log.Panic(fmt.Sprintf("slice[%d,%d) out of bound [%d,%d]", lo, hi, l.FirstIndex(), l.LastIndex()))
 	}
 }
 

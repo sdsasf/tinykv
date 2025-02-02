@@ -28,6 +28,8 @@ type ApplySnapResult struct {
 	Region     *metapb.Region
 }
 
+// compile time check
+// ensure PeerStorage implements the raft.Storage interface
 var _ raft.Storage = new(PeerStorage)
 
 type PeerStorage struct {
@@ -210,6 +212,7 @@ func (ps *PeerStorage) checkRange(low, high uint64) error {
 	if low > high {
 		return errors.Errorf("low %d is greater than high %d", low, high)
 	} else if low <= ps.truncatedIndex() {
+		log.Panicf("low %d is less than truncated index %d\n", low, ps.truncatedIndex())
 		return raft.ErrCompacted
 	} else if high > ps.raftState.LastIndex+1 {
 		return errors.Errorf("entries' high %d is out of bound, lastIndex %d",
@@ -308,7 +311,35 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 // never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
-	return nil
+	if len(entries) == 0 {
+		return nil
+	}
+	psFirstIndex, _ := ps.FirstIndex()
+	psLastIndex, _ := ps.LastIndex()
+	entsFirstIndex := entries[0].Index
+	entsLastIndex := entries[len(entries)-1].Index
+	// check if entries are continuous
+	if entsFirstIndex > psLastIndex+1 {
+		log.Panicf("missing log entry [last: %d, append at: %d]", psLastIndex+1, entsFirstIndex-1)
+	}
+	// already have snapshot, don't need to write log entry into badger
+	if entsLastIndex < psFirstIndex {
+		return nil
+	}
+	// truncate logs before snapshot
+	if entsFirstIndex < psFirstIndex {
+		entries = entries[psFirstIndex-entsFirstIndex:]
+	}
+	// append logs
+	var err error
+	for _, entry := range entries {
+		err = raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, entry.Index), &entry)
+	}
+	// remove logs that will never be committed
+	for i := entsLastIndex + 1; i <= psLastIndex; i++ {
+		raftWB.DeleteMeta(meta.RaftLogKey(ps.region.Id, i))
+	}
+	return err
 }
 
 // Apply the peer with given snapshot
@@ -331,7 +362,38 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
-	return nil, nil
+	var res *ApplySnapResult = nil
+	kvWb := new(engine_util.WriteBatch)
+	raftWb := new(engine_util.WriteBatch)
+	// TODO apply snapshot
+	//if !raft.IsEmptySnap(&ready.Snapshot) {
+	//
+	//}
+
+	if len(ready.Entries) > 0 {
+		// append unstable entries to raft write batch
+		if err := ps.Append(ready.Entries, raftWb); err != nil {
+			return nil, err
+		}
+		newLastIndex := ready.Entries[len(ready.Entries)-1].Index
+		newLastTerm := ready.Entries[len(ready.Entries)-1].Term
+		// should add if(ps.raftState.LastIndex < newLastIndex) ?
+		ps.raftState.LastIndex = newLastIndex
+		ps.raftState.LastTerm = newLastTerm
+	}
+	if !raft.IsEmptyHardState(ready.HardState) {
+		ps.raftState.HardState = &ready.HardState
+	}
+	if err := raftWb.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState); err != nil {
+		return nil, err
+	}
+	if err := kvWb.WriteToDB(ps.Engines.Kv); err != nil {
+		return nil, err
+	}
+	if err := raftWb.WriteToDB(ps.Engines.Raft); err != nil {
+		return nil, err
+	}
+	return res, nil
 }
 
 func (ps *PeerStorage) ClearData() {

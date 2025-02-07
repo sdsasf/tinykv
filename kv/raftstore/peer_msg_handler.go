@@ -5,6 +5,7 @@ import (
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"reflect"
 	"time"
 
 	"github.com/Connor1996/badger/y"
@@ -49,9 +50,22 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	if d.RaftGroup.HasReady() {
 		ready := d.RaftGroup.Ready()
 		// save all ready states except apply committed entries
-		if _, err := d.peer.peerStorage.SaveReadyState(&ready); err != nil {
+		applySnapRet, err := d.peer.peerStorage.SaveReadyState(&ready)
+		if err != nil {
 			panic(err)
 		}
+		// TODO clean up state because snapshot
+		if applySnapRet != nil {
+			if !reflect.DeepEqual(applySnapRet.PrevRegion, applySnapRet.Region) {
+				d.peerStorage.SetRegion(applySnapRet.Region)
+				d.ctx.storeMeta.Lock()
+				d.ctx.storeMeta.regions[applySnapRet.Region.Id] = applySnapRet.Region
+				d.ctx.storeMeta.regionRanges.Delete(&regionItem{region: applySnapRet.PrevRegion})
+				d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: applySnapRet.Region})
+				d.ctx.storeMeta.Unlock()
+			}
+		}
+
 		// send messages to other peers
 		if len(ready.Messages) > 0 {
 			d.peer.Send(d.ctx.trans, ready.Messages)
@@ -88,22 +102,27 @@ func (d *peerMsgHandler) applyEntry(entry *eraftpb.Entry, kvWb *engine_util.Writ
 
 			// check region epoch
 
-			// TODO admin request
-			//if req.AdminRequest != nil {
-			//
-			//}
+			// handle admin request
+			if req.AdminRequest != nil {
+				switch req.AdminRequest.CmdType {
+				case raft_cmdpb.AdminCmdType_CompactLog:
+					d.execCompactLog(req.AdminRequest, kvWb, entry.Index, entry.Term)
+				}
+			}
 
 			// handle first normal request
-			cmd := req.Requests[0]
-			switch cmd.CmdType {
-			case raft_cmdpb.CmdType_Get:
-				d.execGet(cmd, entry.Index, entry.Term)
-			case raft_cmdpb.CmdType_Put:
-				d.execPut(cmd, kvWb, entry.Index, entry.Term)
-			case raft_cmdpb.CmdType_Delete:
-				d.execDelete(cmd, kvWb, entry.Index, entry.Term)
-			case raft_cmdpb.CmdType_Snap:
-				d.execSnap(entry.Index, entry.Term)
+			if len(req.Requests) > 0 {
+				cmd := req.Requests[0]
+				switch cmd.CmdType {
+				case raft_cmdpb.CmdType_Get:
+					d.execGet(cmd, entry.Index, entry.Term)
+				case raft_cmdpb.CmdType_Put:
+					d.execPut(cmd, kvWb, entry.Index, entry.Term)
+				case raft_cmdpb.CmdType_Delete:
+					d.execDelete(cmd, kvWb, entry.Index, entry.Term)
+				case raft_cmdpb.CmdType_Snap:
+					d.execSnap(entry.Index, entry.Term)
+				}
 			}
 		}
 	case eraftpb.EntryType_EntryConfChange:
@@ -163,7 +182,33 @@ func (d *peerMsgHandler) execSnap(index uint64, term uint64) {
 			},
 		},
 	}
+	// only leader need process callback ?
 	d.processCallback(snapResponse, index, term)
+}
+
+func (d *peerMsgHandler) execCompactLog(cmd *raft_cmdpb.AdminRequest, kvWb *engine_util.WriteBatch, index uint64, term uint64) {
+	// compact log
+	compactIndex := cmd.CompactLog.CompactIndex
+	compactTerm := cmd.CompactLog.CompactTerm
+	if compactIndex > d.peerStorage.applyState.TruncatedState.Index {
+		d.peerStorage.applyState.TruncatedState.Index = compactIndex
+		d.peerStorage.applyState.TruncatedState.Term = compactTerm
+		// write apply state to kvdb
+		if err := kvWb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState); err != nil {
+			panic(err)
+		}
+		// schedule compactGC log task
+		d.ScheduleCompactLog(compactIndex)
+	}
+	// response
+	compactResponse := &raft_cmdpb.RaftCmdResponse{
+		Header: &raft_cmdpb.RaftResponseHeader{},
+		AdminResponse: &raft_cmdpb.AdminResponse{
+			CmdType:    raft_cmdpb.AdminCmdType_CompactLog,
+			CompactLog: &raft_cmdpb.CompactLogResponse{},
+		},
+	}
+	d.processCallback(compactResponse, index, term)
 }
 
 func (d *peerMsgHandler) processCallback(resp *raft_cmdpb.RaftCmdResponse, index uint64, term uint64) {
@@ -174,21 +219,25 @@ func (d *peerMsgHandler) processCallback(resp *raft_cmdpb.RaftCmdResponse, index
 	}
 	// if index is equal but term is not equal
 	if d.proposals[0].term != term {
-		// make error response header
-		errResponse := ErrRespStaleCommand(term)
-		// make error response
-		errResponse.Responses = resp.Responses
-		d.proposals[0].cb.Done(errResponse)
+		if d.proposals[0].cb != nil {
+			// make error response header
+			errResponse := ErrRespStaleCommand(term)
+			// make error response
+			errResponse.Responses = resp.Responses
+			d.proposals[0].cb.Done(errResponse)
+		}
 		d.proposals = d.proposals[1:]
 	}
 	if len(d.proposals) > 0 && d.proposals[0].index == index {
 		// now proposals maybe empty or index and term is match
-		if resp.Responses[0].CmdType == raft_cmdpb.CmdType_Snap {
+		if len(resp.Responses) > 0 && resp.Responses[0].CmdType == raft_cmdpb.CmdType_Snap {
 			// create a new transaction for snapshot
 			d.proposals[0].cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
 		}
 		// handle the corresponding proposal
-		d.proposals[0].cb.Done(resp)
+		if d.proposals[0].cb != nil {
+			d.proposals[0].cb.Done(resp)
+		}
 		d.proposals = d.proposals[1:]
 	}
 }
@@ -197,7 +246,9 @@ func (d *peerMsgHandler) processCallback(resp *raft_cmdpb.RaftCmdResponse, index
 func (d *peerMsgHandler) cleanStaleProposals(index uint64, term uint64) {
 	first, end := 0, len(d.proposals)
 	for first < end && d.proposals[first].index < index {
-		d.proposals[first].cb.Done(ErrResp(&util.ErrStaleCommand{}))
+		if d.proposals[first].cb != nil {
+			d.proposals[first].cb.Done(ErrResp(&util.ErrStaleCommand{}))
+		}
 		first++
 	}
 	if first == end {
@@ -278,6 +329,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
+	// propose normal request
 	for len(msg.Requests) > 0 {
 		req := msg.Requests[0]
 		var key []byte
@@ -311,6 +363,26 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			panic(err)
 		}
 		msg.Requests = msg.Requests[1:]
+	}
+	// propose admin request
+	if msg.AdminRequest != nil {
+		switch msg.AdminRequest.CmdType {
+		case raft_cmdpb.AdminCmdType_CompactLog:
+			data, err := msg.Marshal()
+			if err != nil {
+				panic(err)
+			}
+			// add proposal
+			d.proposals = append(d.proposals, &proposal{
+				index: d.nextProposalIndex(),
+				term:  d.Term(),
+				// admin request's callback is nil
+				cb: cb,
+			})
+			if err := d.RaftGroup.Propose(data); err != nil {
+				panic(err)
+			}
+		}
 	}
 
 }

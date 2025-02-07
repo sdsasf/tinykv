@@ -354,7 +354,48 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
-	return nil, nil
+	// delete stale data
+	if ps.isInitialized() {
+		if err := ps.clearMeta(kvWB, raftWB); err != nil {
+			return nil, err
+		}
+		ps.clearExtraData(snapData.Region)
+	}
+
+	// TODO raftState.HardState ??
+	ps.raftState.LastIndex = snapshot.Metadata.Index
+	ps.raftState.LastTerm = snapshot.Metadata.Term
+	ps.applyState.AppliedIndex = snapshot.Metadata.Index
+	ps.applyState.TruncatedState.Index = snapshot.Metadata.Index
+	ps.applyState.TruncatedState.Term = snapshot.Metadata.Term
+	ps.snapState.StateType = snap.SnapState_Applying
+
+	// write raftState and applyState
+	if err := raftWB.SetMeta(meta.RaftStateKey(snapData.Region.Id), ps.raftState); err != nil {
+		return nil, err
+	}
+	if err := kvWB.SetMeta(meta.ApplyStateKey(snapData.Region.Id), ps.applyState); err != nil {
+		return nil, err
+	}
+
+	notifier := make(chan bool, 1)
+	ps.regionSched <- &runner.RegionTaskApply{
+		RegionId: snapData.Region.Id,
+		Notifier: notifier,
+		SnapMeta: snapshot.Metadata,
+		StartKey: snapData.Region.StartKey,
+		EndKey:   snapData.Region.EndKey,
+	}
+	if !(<-notifier) {
+		return nil, errors.New("failed to apply snapshot")
+	}
+
+	applySnapRet := &ApplySnapResult{
+		PrevRegion: ps.region,
+		Region:     snapData.Region,
+	}
+
+	return applySnapRet, nil
 }
 
 // Save memory states to disk.
@@ -365,10 +406,14 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	var res *ApplySnapResult = nil
 	kvWb := new(engine_util.WriteBatch)
 	raftWb := new(engine_util.WriteBatch)
-	// TODO apply snapshot
-	//if !raft.IsEmptySnap(&ready.Snapshot) {
-	//
-	//}
+	// apply snapshot
+	if !raft.IsEmptySnap(&ready.Snapshot) {
+		var err error
+		res, err = ps.ApplySnapshot(&ready.Snapshot, kvWb, raftWb)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	if len(ready.Entries) > 0 {
 		// append unstable entries to raft write batch

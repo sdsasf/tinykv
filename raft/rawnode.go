@@ -78,7 +78,9 @@ func newReady(r *Raft, prevSoftSt *SoftState, prevHardSt pb.HardState) Ready {
 	if hardSt := r.hardState(); !isHardStateEqual(hardSt, prevHardSt) {
 		rd.HardState = hardSt
 	}
-	// TODO snapshot ready
+	if !IsEmptySnap(r.RaftLog.pendingSnapshot) {
+		rd.Snapshot = *r.RaftLog.pendingSnapshot
+	}
 	return rd
 }
 
@@ -178,8 +180,8 @@ func (rn *RawNode) HasReady() bool {
 	if hardSt := r.hardState(); !IsEmptyHardState(hardSt) && !isHardStateEqual(hardSt, rn.prevHardState) {
 		return true
 	}
-	// TODO has pending snapshot ?
-	if len(r.msgs) != 0 || len(r.RaftLog.unstableEntries()) != 0 || r.RaftLog.hasNextEnts() {
+	if len(r.msgs) != 0 || len(r.RaftLog.unstableEntries()) != 0 ||
+		r.RaftLog.hasNextEnts() || !IsEmptySnap(r.RaftLog.pendingSnapshot) {
 		return true
 	}
 	return false
@@ -203,7 +205,8 @@ func (rn *RawNode) Advance(rd Ready) {
 	}
 	// clear all messages in raft
 	rn.Raft.msgs = nil
-	// TODO handle snapshot
+	// clear pending snapshot
+	rn.Raft.RaftLog.pendingSnapshot = nil
 }
 
 // GetProgress return the Progress of this node and its peers, if this

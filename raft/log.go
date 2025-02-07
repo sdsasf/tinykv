@@ -143,6 +143,9 @@ func (l *RaftLog) hasNextEnts() bool {
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
 	if len(l.entries) == 0 {
+		if l.pendingSnapshot != nil {
+			return l.pendingSnapshot.Metadata.Index
+		}
 		i, _ := l.storage.LastIndex()
 		return i
 	}
@@ -152,6 +155,9 @@ func (l *RaftLog) LastIndex() uint64 {
 // FirstIndex return the first index of the log entries
 // if the log is empty, return first index of the storage
 func (l *RaftLog) FirstIndex() uint64 {
+	if l.pendingSnapshot != nil {
+		return l.pendingSnapshot.Metadata.Index + 1
+	}
 	if len(l.entries) == 0 {
 		i, _ := l.storage.FirstIndex()
 		return i
@@ -162,6 +168,9 @@ func (l *RaftLog) FirstIndex() uint64 {
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
+	if l.pendingSnapshot != nil && i == l.pendingSnapshot.Metadata.Index {
+		return l.pendingSnapshot.Metadata.Term, nil
+	}
 	if len(l.entries) > 0 {
 		firstIndex, lastIndex := l.FirstIndex(), l.LastIndex()
 		if i >= firstIndex && i <= lastIndex {
@@ -209,7 +218,8 @@ func (l *RaftLog) truncateAndAppend(ents []pb.Entry) {
 		if debugLogAppend {
 			fmt.Printf("truncate the unstable entries before index %d\n", after)
 		}
-		l.entries = append([]pb.Entry{}, l.slice(l.FirstIndex(), after)...)
+		slice, _ := l.slice(l.FirstIndex(), after)
+		l.entries = append([]pb.Entry{}, slice...)
 		l.entries = append(l.entries, ents...)
 	}
 }
@@ -219,23 +229,34 @@ func (l *RaftLog) EntriesAfter(i uint64) ([]*pb.Entry, error) {
 	if i > l.LastIndex() {
 		return nil, nil
 	}
-	res := convertEntryToPointer(l.slice(i, l.LastIndex()+1))
+	slice, err := l.slice(i, l.LastIndex()+1)
+	if err != nil {
+		return nil, err
+	}
+	res := convertEntryToPointer(slice)
 	return res, nil
 }
 
-func (l *RaftLog) slice(lo, hi uint64) []pb.Entry {
-	l.checkOutOfBounds(lo, hi)
+func (l *RaftLog) slice(lo, hi uint64) ([]pb.Entry, error) {
+	err := l.checkOutOfBounds(lo, hi)
+	if err != nil {
+		return nil, err
+	}
 	off := l.entries[0].Index
-	return l.entries[lo-off : hi-off]
+	return l.entries[lo-off : hi-off], nil
 }
 
-func (l *RaftLog) checkOutOfBounds(lo, hi uint64) {
+func (l *RaftLog) checkOutOfBounds(lo, hi uint64) error {
 	if lo > hi {
 		log.Panic(fmt.Sprintf("invalid unstable.slice %d > %d", lo, hi))
 	}
-	if lo < l.FirstIndex() || hi > l.LastIndex()+1 {
+	if lo < l.FirstIndex() {
+		return ErrCompacted
+	}
+	if hi > l.LastIndex()+1 {
 		log.Panic(fmt.Sprintf("slice[%d,%d) out of bound [%d,%d]", lo, hi, l.FirstIndex(), l.LastIndex()))
 	}
+	return nil
 }
 
 // isUpToDate determines if the given (lastIndex,term) log is more up-to-date

@@ -270,28 +270,64 @@ func (r *Raft) sendAppend(to uint64) bool {
 		Term:    r.Term,
 	}
 	progress := r.Prs[to]
-	// TODO remove printf
-	//fmt.Printf("send append to %d, next is %d\n", to, progress.Next)
-	term, err := r.RaftLog.Term(progress.Next - 1)
-	if err != nil {
-		log.Panic(fmt.Sprintf("error: %v, progress.Next - 1: %d\n", err.Error(), progress.Next-1))
+	if progress.Next < r.RaftLog.FirstIndex() {
+		// send snapshot
+		m.MsgType = pb.MessageType_MsgSnapshot
+		// TODO why send pendingSnapshot ??
+		//if !IsEmptySnap(r.RaftLog.pendingSnapshot) {
+		//	m.Snapshot = r.RaftLog.pendingSnapshot
+		//} else {
+		//	snapshot, err := r.RaftLog.storage.Snapshot()
+		//	if err != nil {
+		//		if err == ErrSnapshotTemporarilyUnavailable {
+		//			// snapshot not ready
+		//			return false
+		//		} else {
+		//			// snapshot failed more than five times
+		//			log.Panic(err.Error())
+		//		}
+		//	}
+		//	m.Snapshot = &snapshot
+		//}
+		// TODO bulid snapshot every time ???
+		snapshot, err := r.RaftLog.storage.Snapshot()
+		if err != nil {
+			if err == ErrSnapshotTemporarilyUnavailable {
+				// snapshot not ready
+				return false
+			} else {
+				// snapshot failed more than five times
+				log.Panic(err.Error())
+			}
+		}
+		m.Snapshot = &snapshot
+	} else {
+		term, err := r.RaftLog.Term(progress.Next - 1)
+		if err != nil {
+			log.Panic(fmt.Sprintf("error: %v, progress.Next - 1: %d\n", err.Error(), progress.Next-1))
+		}
+		ents, _ := r.RaftLog.EntriesAfter(progress.Next)
+		// if there are no new entries, don't send append message
+		//if len(ents) == 0 {
+		//	return false
+		//}
+		m.LogTerm = term
+		m.Index = progress.Next - 1
+		m.Entries = ents
 	}
-	ents, _ := r.RaftLog.EntriesAfter(progress.Next)
-	// if there are no new entries, don't send append message
-	//if len(ents) == 0 {
-	//	return false
-	//}
-	m.LogTerm = term
-	m.Index = progress.Next - 1
-	m.Entries = ents
-	m.Commit = r.RaftLog.committed
 
+	m.Commit = r.RaftLog.committed
 	r.send(m)
 	if debugLogAppend {
-		fmt.Printf("%v %x send %d append entry to %x at term %d, commitIndex %v, prevIndex %d, prevLogTerm %d\n",
-			r.State, r.id, len(m.Entries), to, r.Term, m.Commit, m.Index, m.LogTerm)
-		if debugPrintEntries && len(m.Entries) > 0 {
-			printEntries(m.Entries)
+		if m.MsgType == pb.MessageType_MsgAppend {
+			fmt.Printf("%v %x send %d append entry to %x at term %d, commitIndex %v, prevIndex %d, prevLogTerm %d\n",
+				r.State, r.id, len(m.Entries), to, r.Term, m.Commit, m.Index, m.LogTerm)
+			if debugPrintEntries && len(m.Entries) > 0 {
+				printEntries(m.Entries)
+			}
+		} else {
+			fmt.Printf("%v %x send snapshot to %x at term %d, snapLastIndex %d, snapLastTerm %d\n",
+				r.State, r.id, to, r.Term, m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term)
 		}
 	}
 	return true
@@ -570,12 +606,13 @@ func stepLeader(r *Raft, m pb.Message) error {
 			r.sendAppend(m.From)
 		} else {
 			if m.Index > r.Prs[m.From].Match {
-				//if debugLogAppend {
-				//	fmt.Printf("%x received MsgAppResp(accepted, index %d) from %x",
-				//		r.id, m.Index, m.From)
-				//}
+				if debugLogAppend {
+					fmt.Printf("%x received MsgAppResp(accepted, index %d) from %x",
+						r.id, m.Index, m.From)
+				}
+				// if append success, m.index must larger than r.Prs[m.From].Match
 				r.Prs[m.From].Match = m.Index
-				r.Prs[m.From].Next = max(m.Index+1, r.Prs[m.From].Next)
+				r.Prs[m.From].Next = m.Index + 1
 				if debugLogAppend {
 					fmt.Printf("%x update %x match index to %d, next to %d\n", r.id, m.From, r.Prs[m.From].Match, r.Prs[m.From].Next)
 				}
@@ -670,8 +707,6 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	if lastNewIndex, ok := r.RaftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, m.Entries...); ok {
 		// if append success, message.Index is lastNewIndex
 
-		// TODO remove printf
-		//fmt.Printf("%d response append entry, lastNewIndex is %d\n", r.id, lastNewIndex)
 		r.send(pb.Message{
 			MsgType: pb.MessageType_MsgAppendResponse,
 			To:      m.From,
@@ -725,6 +760,52 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	snapLastIndex := m.Snapshot.Metadata.Index
+	// snapIndex <= committedIndex, logs maybe apply multiple times
+	// snapIndex <= firstIndex, already have snapshot
+	if snapLastIndex <= r.RaftLog.committed || snapLastIndex <= r.RaftLog.FirstIndex() {
+		r.send(pb.Message{
+			MsgType: pb.MessageType_MsgAppendResponse,
+			To:      m.From,
+			From:    r.id,
+			Term:    r.Term,
+			Index:   r.RaftLog.committed,
+			Reject:  true,
+		})
+		return
+	}
+	// clean compacted log entries, but not persistent in engine, need persist in applySnapshot()
+	if snapLastIndex >= r.RaftLog.LastIndex() {
+		r.RaftLog.entries = nil
+	} else {
+		r.RaftLog.entries = r.RaftLog.entries[snapLastIndex-r.RaftLog.FirstIndex()+1:]
+	}
+
+	// use snapshot conf
+	shotConf := m.Snapshot.Metadata.ConfState
+	if shotConf != nil {
+		r.Prs = make(map[uint64]*Progress)
+		for _, node := range shotConf.Nodes {
+			r.Prs[node] = &Progress{}
+			r.Prs[node].Next = r.RaftLog.LastIndex() + 1
+			r.Prs[node].Match = 0
+		}
+	}
+	// record snapshot in pendingSnapshot
+	// to wait for applySnapshot() to persist snapshot and clean persisted log entries
+	r.RaftLog.pendingSnapshot = m.Snapshot
+	r.RaftLog.stabled = max(r.RaftLog.stabled, snapLastIndex)
+	// snapLastIndex must large than r.RaftLog.committed and applied
+	r.RaftLog.committed = snapLastIndex
+	r.RaftLog.applied = snapLastIndex
+	r.send(pb.Message{
+		MsgType: pb.MessageType_MsgAppendResponse,
+		To:      m.From,
+		From:    r.id,
+		Term:    r.Term,
+		Index:   snapLastIndex,
+		Reject:  false,
+	})
 }
 
 // addNode add a new node to raft group

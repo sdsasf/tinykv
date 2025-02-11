@@ -27,13 +27,14 @@ import (
 
 // print debug information
 const (
-	debugElection      bool = false
-	debugStateTransfer      = false
-	debugHeartBeat          = false
-	debugLogAppend          = false
-	debugPrintEntries       = false
-	debugMessage            = false
-	debugRaft               = false
+	debugElection       bool = false
+	debugStateTransfer       = false
+	debugHeartBeat           = false
+	debugLogAppend           = false
+	debugPrintEntries        = false
+	debugMessage             = false
+	debugRaft                = false
+	debugLeaderTransfer      = false
 )
 
 // None is a placeholder node ID used when there is no leader.
@@ -620,6 +621,11 @@ func stepLeader(r *Raft, m pb.Message) error {
 					r.bcastAppend()
 				}
 			}
+			// Transfer leadership is in progress
+			// actually if append success, leaderTransferee's log must be up-to-date
+			if r.leadTransferee == m.From && r.Prs[m.From].Match == r.RaftLog.LastIndex() {
+				r.sendTimeoutNow(m.From)
+			}
 		}
 	case pb.MessageType_MsgBeat:
 		//fmt.Printf("%d enter bcastheartbeat\n", r.id)
@@ -634,8 +640,49 @@ func stepLeader(r *Raft, m pb.Message) error {
 		if len(m.Entries) == 0 {
 			panic(fmt.Sprintf("%x stepped empty MsgProp", r.id))
 		}
+		if r.leadTransferee != None {
+			if debugLeaderTransfer {
+				fmt.Printf("%x transfer leadership to %x is in progress, ignore proposal\n", r.id, r.leadTransferee)
+			}
+			return ErrProposalDropped
+		}
 		r.appendEntry(m.Entries...)
 		r.bcastAppend()
+	case pb.MessageType_MsgTransferLeader:
+		leaderTransferee := m.From
+		if r.Prs[leaderTransferee] == nil {
+			if debugLeaderTransfer {
+				fmt.Printf("%x is not in the cluster, ignore leader transfer\n", leaderTransferee)
+			}
+			return nil
+		}
+		lastLeaderTransferee := r.leadTransferee
+		if lastLeaderTransferee != None {
+			// transfer leadership is in progress, ignores request to same node
+			if lastLeaderTransferee == leaderTransferee {
+				return nil
+			}
+			// abort the previous leader transfer
+			r.leadTransferee = None
+		}
+		if leaderTransferee == r.id {
+			return nil
+		}
+		r.leadTransferee = leaderTransferee
+		// TODO why update electionElapsed ?
+		r.electionElapsed = 0
+		if r.Prs[leaderTransferee].Match == r.RaftLog.LastIndex() {
+			if debugLeaderTransfer {
+				fmt.Printf("%x send timeoutNow message to %x\n", r.id, leaderTransferee)
+			}
+			r.sendTimeoutNow(leaderTransferee)
+		} else {
+			if debugLeaderTransfer {
+				fmt.Printf("%x send append message to %x\n", r.id, leaderTransferee)
+			}
+			r.leadTransferee = leaderTransferee
+			r.sendAppend(leaderTransferee)
+		}
 	}
 	return nil
 }
@@ -683,6 +730,18 @@ func stepFollower(r *Raft, m pb.Message) error {
 		r.electionElapsed = 0
 		r.Lead = m.From
 		r.handleSnapshot(m)
+	case pb.MessageType_MsgTimeoutNow:
+		r.hup()
+	case pb.MessageType_MsgTransferLeader:
+		if r.Lead == None {
+			if debugLeaderTransfer {
+				fmt.Printf("%x no leader at term %d; dropping leader transfer msg", r.id, r.Term)
+			}
+			return nil
+		}
+		// transfer message to leader
+		m.To = r.Lead
+		r.send(m)
 	}
 	return nil
 }
@@ -811,11 +870,36 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	_, ok := r.Prs[id]
+	if ok {
+		// node already in the raft group
+		return
+	}
+	r.Prs[id] = &Progress{
+		Match: 0,
+		Next:  r.RaftLog.LastIndex() + 1,
+	}
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	_, ok := r.Prs[id]
+	if !ok {
+		// node not in the raft group
+		return
+	}
+	delete(r.Prs, id)
+	// update commit index
+	if r.State == StateLeader {
+		if len(r.Prs) > 0 {
+			oldCommit := r.RaftLog.committed
+			r.maybeCommit()
+			if r.RaftLog.committed != oldCommit {
+				r.bcastAppend()
+			}
+		}
+	}
 }
 
 func (r *Raft) reset(term uint64) {
@@ -857,6 +941,14 @@ func (r *Raft) send(m pb.Message) {
 	r.msgs = append(r.msgs, m)
 }
 
+func (r *Raft) sendTimeoutNow(leaderTransferee uint64) {
+	r.send(pb.Message{
+		MsgType: pb.MessageType_MsgTimeoutNow,
+		To:      leaderTransferee,
+		From:    r.id,
+	})
+}
+
 func (r *Raft) hup() {
 	if r.State == StateLeader {
 		if debugElection {
@@ -864,7 +956,11 @@ func (r *Raft) hup() {
 		}
 		return
 	}
-	// TODO judge config message
+	// node is not in the cluster, nothing happen
+	// TODO why judge if node have pendingSnapshot ?
+	if r.Prs[r.id] == nil {
+		return
+	}
 
 	r.campaign()
 }
@@ -878,14 +974,15 @@ func (r *Raft) campaign() {
 	// broadcast request vote
 	for peer := range r.Prs {
 		if peer != r.id {
-			r.send(pb.Message{
-				MsgType: pb.MessageType_MsgRequestVote,
-				To:      peer,
-				From:    r.id,
-				Term:    r.Term,
-				LogTerm: r.RaftLog.LastTerm(),
-				Index:   r.RaftLog.LastIndex(),
-			})
+			r.sendRequestVote(peer)
+			//r.send(pb.Message{
+			//	MsgType: pb.MessageType_MsgRequestVote,
+			//	To:      peer,
+			//	From:    r.id,
+			//	Term:    r.Term,
+			//	LogTerm: r.RaftLog.LastTerm(),
+			//	Index:   r.RaftLog.LastIndex(),
+			//})
 		}
 	}
 }

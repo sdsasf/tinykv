@@ -127,6 +127,11 @@ func (d *peerMsgHandler) applyEntry(entry *eraftpb.Entry, kvWb *engine_util.Writ
 		}
 	case eraftpb.EntryType_EntryConfChange:
 		// TODO handle conf change
+		newConf := new(eraftpb.ConfChange)
+		if err := newConf.Unmarshal(entry.Data); err != nil {
+			panic(err)
+		}
+		d.RaftGroup.ApplyConfChange(*newConf)
 	}
 }
 
@@ -382,6 +387,19 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			if err := d.RaftGroup.Propose(data); err != nil {
 				panic(err)
 			}
+		case raft_cmdpb.AdminCmdType_TransferLeader:
+			d.RaftGroup.TransferLeader(msg.AdminRequest.TransferLeader.Peer.Id)
+			transferLeaderResponse := &raft_cmdpb.RaftCmdResponse{
+				Header: &raft_cmdpb.RaftResponseHeader{},
+				AdminResponse: &raft_cmdpb.AdminResponse{
+					CmdType:        raft_cmdpb.AdminCmdType_TransferLeader,
+					TransferLeader: &raft_cmdpb.TransferLeaderResponse{},
+				},
+			}
+			cb.Done(transferLeaderResponse)
+		case raft_cmdpb.AdminCmdType_ChangePeer:
+		case raft_cmdpb.AdminCmdType_Split:
+
 		}
 	}
 

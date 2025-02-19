@@ -17,6 +17,7 @@ package raft
 import (
 	"errors"
 	"fmt"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
 	"github.com/pingcap/log"
 	"math/rand"
 	"sync"
@@ -35,6 +36,7 @@ const (
 	debugMessage             = false
 	debugRaft                = false
 	debugLeaderTransfer      = false
+	debugConfChange          = false
 )
 
 // None is a placeholder node ID used when there is no leader.
@@ -302,6 +304,8 @@ func (r *Raft) sendAppend(to uint64) bool {
 			}
 		}
 		m.Snapshot = &snapshot
+		// update next immediately after send snapshot
+		r.Prs[to].Next = snapshot.Metadata.Index + 1
 	} else {
 		term, err := r.RaftLog.Term(progress.Next - 1)
 		if err != nil {
@@ -318,6 +322,12 @@ func (r *Raft) sendAppend(to uint64) bool {
 	}
 
 	m.Commit = r.RaftLog.committed
+	if len(r.Prs) <= 2 {
+		// in case of sendAppend lost
+		for i := 0; i < 4; i++ {
+			r.send(m)
+		}
+	}
 	r.send(m)
 	if debugLogAppend {
 		if m.MsgType == pb.MessageType_MsgAppend {
@@ -361,7 +371,9 @@ func (r *Raft) sendHeartbeat(to uint64) {
 		To:      to,
 		From:    r.id,
 		Term:    r.Term,
-		Commit:  r.RaftLog.committed,
+		// for maybeCreatPeer, only heartbeat and commit is RaftInvalidIndex could creat peer
+		Commit: util.RaftInvalidIndex,
+		// Commit:  r.RaftLog.committed,
 		Entries: nil,
 	}
 	r.send(heartBeatMessage)
@@ -814,6 +826,10 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		Term:    r.Term,
 		Commit:  r.RaftLog.committed,
 	})
+	if debugHeartBeat {
+		fmt.Printf("%x received heartbeat from %x at term %d, reply commitIndex is %d\n",
+			r.id, m.From, r.Term, r.RaftLog.committed)
+	}
 }
 
 // handleSnapshot handle Snapshot RPC request
@@ -873,11 +889,17 @@ func (r *Raft) addNode(id uint64) {
 	_, ok := r.Prs[id]
 	if ok {
 		// node already in the raft group
+		if debugConfChange {
+			fmt.Printf("%x node %x already in the raft group\n", r.id, id)
+		}
 		return
 	}
 	r.Prs[id] = &Progress{
 		Match: 0,
 		Next:  r.RaftLog.LastIndex() + 1,
+	}
+	if debugConfChange {
+		fmt.Printf("%x add node %x\n", r.id, id)
 	}
 }
 
@@ -899,6 +921,9 @@ func (r *Raft) removeNode(id uint64) {
 				r.bcastAppend()
 			}
 		}
+	}
+	if debugConfChange {
+		fmt.Printf("%x remove node %x\n", r.id, id)
 	}
 }
 

@@ -16,6 +16,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
 	"path"
 	"sync"
 	"time"
@@ -279,7 +280,48 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 // processRegionHeartbeat updates the region information.
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
 	// Your Code Here (3C).
+	if region.GetMeta() == nil {
+		// heartbeat with no region info
+		return nil
+	}
+	if region.GetRegionEpoch() == nil {
+		return errors.Errorf("nil epoch")
+	}
 
+	oldRegionInfo := c.GetRegion(region.GetID())
+	// region already exists
+	if oldRegionInfo != nil {
+		if oldRegionInfo.GetRegionEpoch() == nil {
+			return errors.Errorf("nil epoch")
+		}
+		if util.IsEpochStale(region.GetRegionEpoch(), oldRegionInfo.GetRegionEpoch()) {
+			// stale region heartbeat
+			return ErrRegionIsStale(region.GetMeta(), oldRegionInfo.GetMeta())
+		}
+	} else {
+		// region not exists
+		// scan all overlap regions, -1 < 0 means no limit
+		overlapRegionInfos := c.ScanRegions(region.GetStartKey(), region.GetEndKey(), -1)
+		// check heartbeat regionEpoch > all overlap regions
+		for _, overlapRegionInfo := range overlapRegionInfos {
+			if overlapRegionInfo.GetRegionEpoch() == nil {
+				return errors.Errorf("nil epoch")
+			}
+			if util.IsEpochStale(region.GetRegionEpoch(), overlapRegionInfo.GetRegionEpoch()) {
+				return ErrRegionIsStale(region.GetMeta(), overlapRegionInfo.GetMeta())
+			}
+		}
+	}
+	// TODO check what heartbeat could skip, now all heartbeat will be processed
+
+	// update region
+	if err := c.putRegion(region); err != nil {
+		return err
+	}
+	// update all store status, regionInfo and storeInfo are seperated
+	for _, storeStateInfo := range c.GetStores() {
+		c.updateStoreStatusLocked(storeStateInfo.GetID())
+	}
 	return nil
 }
 

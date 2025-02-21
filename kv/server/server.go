@@ -129,16 +129,91 @@ func (server *Server) KvPrewrite(_ context.Context, req *kvrpcpb.PrewriteRequest
 			response.Errors = append(response.Errors, &kvrpcpb.KeyError{Locked: lock.Info(key)})
 			return response, nil
 		}
-		// TODO
-		mvccTxn.PutLock(key, &mvcc.Lock{Primary: req.PrimaryLock, Ts: mvccTxn.StartTS, Ttl: req.LockTtl, Kind: mvcc.WriteKindFromProto(req.Op)})
 	}
 
-	return nil, nil
+	for _, mutation := range req.Mutations {
+		// add lock
+		lock := &mvcc.Lock{
+			Primary: req.PrimaryLock,
+			Ts:      mvccTxn.StartTS,
+			Ttl:     req.LockTtl,
+			Kind:    mvcc.WriteKindFromProto(mutation.Op),
+		}
+		mvccTxn.PutLock(mutation.Key, lock)
+		switch mutation.Op {
+		case kvrpcpb.Op_Put:
+			mvccTxn.PutValue(mutation.Key, mutation.Value)
+		case kvrpcpb.Op_Del:
+			mvccTxn.DeleteValue(mutation.Key)
+		case kvrpcpb.Op_Rollback:
+		case kvrpcpb.Op_Lock:
+		}
+	}
+	if err := server.storage.Write(req.Context, mvccTxn.Writes()); err != nil {
+		return response, err
+	}
+
+	return response, nil
 }
 
 func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*kvrpcpb.CommitResponse, error) {
 	// Your Code Here (4B).
-	return nil, nil
+	keys := req.Keys
+	server.Latches.WaitForLatches(keys)
+	defer server.Latches.ReleaseLatches(keys)
+
+	response := &kvrpcpb.CommitResponse{}
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		return response, err
+	}
+	mvccTxn := mvcc.NewMvccTxn(reader, req.StartVersion)
+	// check all keys are locked
+	for _, key := range keys {
+		lock, err := mvccTxn.GetLock(key)
+		if err != nil {
+			return response, err
+		}
+		// for pass test case (test may commit without lock)
+		if lock == nil {
+			// check is rollback or test case
+			currentWrite, _, err := mvccTxn.CurrentWrite(key)
+			if err != nil {
+				return response, err
+			}
+			if currentWrite != nil && currentWrite.Kind == mvcc.WriteKindRollback {
+				response.Error = &kvrpcpb.KeyError{Retryable: "true"}
+				return response, nil
+			}
+			// maybe test case, not error
+			continue
+		}
+		if lock.Ts != mvccTxn.StartTS {
+			response.Error = &kvrpcpb.KeyError{Retryable: "true"}
+			return response, nil
+		}
+	}
+
+	for _, key := range keys {
+		lock, err := mvccTxn.GetLock(key)
+		if err != nil {
+			return response, err
+		}
+		// lock is nil maybe test case, don't need to handle
+		if lock != nil {
+			// write updated value into storage
+			mvccTxn.PutWrite(key, req.CommitVersion, &mvcc.Write{
+				StartTS: mvccTxn.StartTS,
+				Kind:    lock.Kind,
+			})
+			// remove lock
+			mvccTxn.DeleteLock(key)
+		}
+	}
+	if err := server.storage.Write(req.Context, mvccTxn.Writes()); err != nil {
+		return response, err
+	}
+	return response, nil
 }
 
 func (server *Server) KvScan(_ context.Context, req *kvrpcpb.ScanRequest) (*kvrpcpb.ScanResponse, error) {

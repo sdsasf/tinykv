@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"github.com/pingcap-incubator/tinykv/kv/transaction/mvcc"
 
 	"github.com/pingcap-incubator/tinykv/kv/coprocessor"
 	"github.com/pingcap-incubator/tinykv/kv/storage"
@@ -50,11 +51,88 @@ func (server *Server) Snapshot(stream tinykvpb.TinyKv_SnapshotServer) error {
 // Transactional API.
 func (server *Server) KvGet(_ context.Context, req *kvrpcpb.GetRequest) (*kvrpcpb.GetResponse, error) {
 	// Your Code Here (4B).
-	return nil, nil
+	var keys [][]byte
+	keys = append(keys, req.Key)
+	server.Latches.WaitForLatches(keys)
+	defer server.Latches.ReleaseLatches(keys)
+
+	response := &kvrpcpb.GetResponse{}
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		return response, err
+	}
+
+	mvccTxn := mvcc.NewMvccTxn(reader, req.Version)
+	// check is key locked after txn start
+	lock, err := mvccTxn.GetLock(req.Key)
+	if err != nil {
+		return response, err
+	}
+	if lock != nil && lock.Ts <= req.Version {
+		response.Error = &kvrpcpb.KeyError{Locked: lock.Info(req.Key)}
+		return response, nil
+	}
+
+	value, err := mvccTxn.GetValue(req.Key)
+	if err != nil {
+		return response, err
+	}
+	if value == nil {
+		response.NotFound = true
+	} else {
+		response.Value = value
+	}
+	return response, nil
 }
 
 func (server *Server) KvPrewrite(_ context.Context, req *kvrpcpb.PrewriteRequest) (*kvrpcpb.PrewriteResponse, error) {
 	// Your Code Here (4B).
+	var keys [][]byte
+	for _, mutation := range req.Mutations {
+		keys = append(keys, mutation.Key)
+	}
+	server.Latches.WaitForLatches(keys)
+	defer server.Latches.ReleaseLatches(keys)
+
+	response := &kvrpcpb.PrewriteResponse{}
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		return response, err
+	}
+	mvccTxn := mvcc.NewMvccTxn(reader, req.StartVersion)
+	// check w-w conflict first
+	for _, key := range keys {
+		// read the most recent write to check w-w conflict
+		write, commitTs, err := mvccTxn.MostRecentWrite(key)
+		if err != nil {
+			return response, err
+		}
+		// TODO commitTs == req.StartVersion is OK ?
+		if write != nil && commitTs >= req.StartVersion {
+			response.Errors = append(response.Errors, &kvrpcpb.KeyError{Conflict: &kvrpcpb.WriteConflict{
+				StartTs:    write.StartTS,
+				ConflictTs: commitTs,
+				Key:        key,
+				Primary:    req.PrimaryLock,
+			}})
+			return response, nil
+		}
+	}
+
+	// check is key locked after txn start
+	for _, key := range keys {
+		lock, err := mvccTxn.GetLock(key)
+		if err != nil {
+			return response, err
+		}
+		if lock != nil {
+			response.Errors = append(response.Errors, &kvrpcpb.KeyError{Locked: lock.Info(key)})
+			return response, nil
+		}
+		// TODO
+		mvccTxn.PutLock(key, &mvcc.Lock{Primary: req.PrimaryLock, Ts: mvccTxn.StartTS, Ttl: req.LockTtl, Kind: mvcc.WriteKindFromProto(req.Op)})
+	}
+
 	return nil, nil
 }
 
